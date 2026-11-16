@@ -1,0 +1,35 @@
+name: Update Lilly Job Feed
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-feed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Generate XML feed
+        run: python lilly_job_sync.py
+
+      - name: Commit and push updated feed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add lilly_pharma360_feed.xml
+          git diff --staged --quiet || (git commit -m "chore: update Lilly job XML feed" && git push)

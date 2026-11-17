@@ -1,5 +1,8 @@
 import time
+import random
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
@@ -7,18 +10,58 @@ from xml.dom import minidom
 TENANT = "lilly"
 SITE = "LLY"
 BASE_URL = f"https://{TENANT}.wd115.myworkdayjobs.com"
+CAREER_PAGE_URL = f"{BASE_URL}/en-US/{SITE}"
 LIST_ENDPOINT = f"{BASE_URL}/wday/cxs/{TENANT}/{SITE}/jobs"
 
 # Zet SEARCH_TEXT op "Netherlands" voor alleen NL, of "" voor wereldwijd
 SEARCH_TEXT = "Netherlands"
 
 HEADERS = {
-    "Content-Type": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
     "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0 (compatible; Pharma360JobSync/1.0)"
+    "Accept-Language": "en-US,en;q=0.9,nl;q=0.8",
+    "Content-Type": "application/json",
+    "Origin": BASE_URL,
+    "Referer": CAREER_PAGE_URL,
 }
 
-def fetch_job_list(search_text=""):
+
+def create_session():
+    """Maakt een requests.Session met automatische retries bij HTTP 429/5xx en haalt sessie-cookies op."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=6,
+        backoff_factor=3,  # Wacht 3s, 6s, 12s, 24s, 48s, 96s bij 429
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(HEADERS)
+
+    # Haal eerst de reguliere werken-bij pagina op zodat Workday sessie-cookies (PLAY_SESSION e.d.) zet
+    try:
+        init_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+        session.get(CAREER_PAGE_URL, headers=init_headers, timeout=15)
+        csrf_token = session.cookies.get("CALYPSO_CSRF_TOKEN")
+        if csrf_token:
+            session.headers["X-Calypso-Csrf-Token"] = csrf_token
+        time.sleep(1.0)
+    except requests.RequestException as e:
+        print(f"Waarschuwing bij initialiseren van sessie-cookies: {e}")
+
+    return session
+
+
+def fetch_job_list(session, search_text=""):
     """Haalt alle vacature-paden op via gepagineerde POST-verzoeken (max 20 per keer)."""
     jobs = []
     offset = 0
@@ -32,7 +75,7 @@ def fetch_job_list(search_text=""):
             "searchText": search_text,
             "appliedFacets": {}
         }
-        response = requests.post(LIST_ENDPOINT, json=payload, headers=HEADERS, timeout=15)
+        response = session.post(LIST_ENDPOINT, json=payload, timeout=20)
         response.raise_for_status()
         data = response.json()
 
@@ -52,16 +95,18 @@ def fetch_job_list(search_text=""):
         if offset >= total:
             break
 
-        time.sleep(0.5)  # Korte pauze tegen rate-limiting
+        time.sleep(random.uniform(1.0, 2.0))  # Pauze tegen rate-limiting
 
     return jobs
 
-def fetch_job_details(external_path):
+
+def fetch_job_details(session, external_path):
     """Haalt de volledige vacaturetekst en metadata op via een GET-verzoek."""
     detail_url = f"{BASE_URL}/wday/cxs/{TENANT}/{SITE}{external_path}"
-    response = requests.get(detail_url, headers=HEADERS, timeout=15)
+    response = session.get(detail_url, timeout=20)
     response.raise_for_status()
     return response.json().get("jobPostingInfo", {})
+
 
 def build_xml_feed(jobs_data, output_file="lilly_pharma360_feed.xml"):
     """Zet de opgehaalde vacatures om naar een standaard XML-jobfeed."""
@@ -93,8 +138,10 @@ def build_xml_feed(jobs_data, output_file="lilly_pharma360_feed.xml"):
         f.write(xml_bytes)
     print(f"XML-feed succesvol opgeslagen in: {output_file}")
 
+
 if __name__ == "__main__":
-    summary_list = fetch_job_list(SEARCH_TEXT)
+    http_session = create_session()
+    summary_list = fetch_job_list(http_session, SEARCH_TEXT)
     full_jobs = []
 
     for idx, summary in enumerate(summary_list, start=1):
@@ -102,9 +149,9 @@ if __name__ == "__main__":
         if not ext_path:
             continue
         print(f"[{idx}/{len(summary_list)}] Details ophalen voor: {summary.get('title')}")
-        details = fetch_job_details(ext_path)
+        details = fetch_job_details(http_session, ext_path)
         details["externalPath"] = ext_path
         full_jobs.append(details)
-        time.sleep(0.3)  # Voorkom HTTP 429 bij het ophalen van detailpagina's
+        time.sleep(random.uniform(0.8, 1.5))  # Voorkom HTTP 429 bij het ophalen van detailpagina's
 
     build_xml_feed(full_jobs)
